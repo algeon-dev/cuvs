@@ -26,6 +26,19 @@ extern "C" {
  */
 typedef enum { CUVS_ERROR = 0, CUVS_SUCCESS = 1 } cuvsError_t;
 
+/** @brief The kind of error from a C API call that passed through the exception boundary. */
+typedef enum {
+  CUVS_ERROR_KIND_NONE                 = 0,
+  CUVS_ERROR_KIND_UNKNOWN              = 1,
+  CUVS_ERROR_KIND_DEVICE_OUT_OF_MEMORY = 2,
+  CUVS_ERROR_KIND_HOST_OUT_OF_MEMORY   = 3
+} cuvsErrorKind_t;
+
+/** @brief Returns the calling thread's error kind for the most recent C API call that
+ *         passed through the exception boundary. Returns CUVS_ERROR_KIND_NONE after success.
+ */
+CUVS_EXPORT cuvsErrorKind_t cuvsGetLastErrorKind(void);
+
 /** @brief Returns a string describing the last seen error on this thread, or
  *         NULL if the last function succeeded.
  */

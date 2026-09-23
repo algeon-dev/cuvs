@@ -27,7 +27,11 @@ int main()
     exit(EXIT_FAILURE);
   }
   if (cuvsResourcesSetStreamPool(res, 0) != CUVS_ERROR ||
-      cuvsResourcesSetStreamPool(res, 2) != CUVS_SUCCESS ||
+      cuvsGetLastErrorKind() != CUVS_ERROR_KIND_UNKNOWN || cuvsGetLastErrorText() == NULL) {
+    exit(EXIT_FAILURE);
+  }
+  if (cuvsResourcesSetStreamPool(res, 2) != CUVS_SUCCESS ||
+      cuvsGetLastErrorKind() != CUVS_ERROR_KIND_NONE || cuvsGetLastErrorText() != NULL ||
       cuvsResourcesGetStreamPoolSize(res, &pool_size) != CUVS_SUCCESS || pool_size != 2) {
     exit(EXIT_FAILURE);
   }

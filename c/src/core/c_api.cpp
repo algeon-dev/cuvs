@@ -272,6 +272,11 @@ extern "C" cuvsError_t cuvsRMMHostFree(void* ptr, size_t bytes)
 }
 
 thread_local std::string last_error_text = "";
+thread_local cuvsErrorKind_t last_error_kind = CUVS_ERROR_KIND_NONE;
+
+void cuvs::core::set_last_error_kind(cuvsErrorKind_t kind) { last_error_kind = kind; }
+
+extern "C" cuvsErrorKind_t cuvsGetLastErrorKind(void) { return last_error_kind; }
 
 extern "C" const char* cuvsGetLastErrorText()
 {
