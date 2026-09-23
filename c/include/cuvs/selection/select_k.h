@@ -6,6 +6,7 @@
 
 #include <cuvs/core/c_api.h>
 #include <dlpack/dlpack.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +32,31 @@ CUVS_EXPORT cuvsError_t cuvsSelectK(cuvsResources_t res,
                                     DLManagedTensor* in_val,
                                     DLManagedTensor* out_val,
                                     DLManagedTensor* out_idx);
+
+/**
+ * @brief Select the k smallest or largest values from each row of a device
+ * matrix.
+ *
+ * Requires batch >= 1 and 1 <= k <= len. Each row of `in_val` has `len` values.
+ * `out_idx` receives their int64 column positions in [0, len). When `sorted` is
+ * true, each output row is ordered by
+ * value (ascending for `select_min`, descending otherwise). The order of equal
+ * values is unspecified.
+ *
+ * @param[in]  res         cuvsResources_t handle
+ * @param[in]  in_val      DLManagedTensor* shape [batch, len], float32, row-major device
+ * @param[out] out_val     DLManagedTensor* shape [batch, k], float32, row-major device
+ * @param[out] out_idx     DLManagedTensor* shape [batch, k], int64, row-major device
+ * @param[in]  select_min  Select smallest values if true, largest if false
+ * @param[in]  sorted      Order each output row by value if true
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsSelectKBatched(cuvsResources_t res,
+                                           DLManagedTensor* in_val,
+                                           DLManagedTensor* out_val,
+                                           DLManagedTensor* out_idx,
+                                           bool select_min,
+                                           bool sorted);
 
 #ifdef __cplusplus
 }
