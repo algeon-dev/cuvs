@@ -176,6 +176,44 @@ CUVS_EXPORT cuvsError_t cuvsResourcesSetWorkspacePool(cuvsResources_t res,
                                                       size_t initial_size_bytes);
 
 /**
+ * @brief Install a RAFT CUDA stream pool on a resources handle, replacing any existing pool.
+ *
+ * The pool owns its streams for the lifetime of res or until the pool is replaced. RAFT
+ * algorithms may issue work and device allocations on these streams. Synchronize work and
+ * retire any external stream attachments before replacing the pool or destroying res.
+ *
+ * @param[in] res cuvsResources_t opaque C handle
+ * @param[in] pool_size Number of streams to create; must be at least 1
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsResourcesSetStreamPool(cuvsResources_t res, size_t pool_size);
+
+/**
+ * @brief Get the number of streams in a resources handle's RAFT CUDA stream pool.
+ *
+ * @param[in] res cuvsResources_t opaque C handle
+ * @param[out] pool_size Pool size, or 0 if no pool is installed
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsResourcesGetStreamPoolSize(cuvsResources_t res, size_t* pool_size);
+
+/**
+ * @brief Borrow a CUDA stream from a resources handle's RAFT CUDA stream pool.
+ *
+ * The pool owns the returned stream for the lifetime of res or until the pool is replaced.
+ * RAFT algorithms may issue work and device allocations on it. Index must be less than the
+ * pool size reported by ::cuvsResourcesGetStreamPoolSize.
+ *
+ * @param[in] res cuvsResources_t opaque C handle
+ * @param[in] index Zero-based pool stream index
+ * @param[out] stream Borrowed CUDA stream
+ * @return cuvsError_t
+ */
+CUVS_EXPORT cuvsError_t cuvsResourcesGetStreamPoolStream(cuvsResources_t res,
+                                                        size_t index,
+                                                        cudaStream_t* stream);
+
+/**
  * @brief Create an Initialized opaque C handle for C++ type `raft::device_resources_snmg`
  *        for multi-GPU operations
  *

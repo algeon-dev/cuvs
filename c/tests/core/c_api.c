@@ -22,6 +22,24 @@ int main()
   cuvsError_t stream_error = cuvsStreamSet(res, stream);
   if (stream_error == CUVS_ERROR) { exit(EXIT_FAILURE); }
 
+  size_t pool_size = 1;
+  if (cuvsResourcesGetStreamPoolSize(res, &pool_size) != CUVS_SUCCESS || pool_size != 0) {
+    exit(EXIT_FAILURE);
+  }
+  if (cuvsResourcesSetStreamPool(res, 0) != CUVS_ERROR ||
+      cuvsResourcesSetStreamPool(res, 2) != CUVS_SUCCESS ||
+      cuvsResourcesGetStreamPoolSize(res, &pool_size) != CUVS_SUCCESS || pool_size != 2) {
+    exit(EXIT_FAILURE);
+  }
+  cudaStream_t pool_streams[2];
+  if (cuvsResourcesGetStreamPoolStream(res, 0, &pool_streams[0]) != CUVS_SUCCESS ||
+      cuvsResourcesGetStreamPoolStream(res, 1, &pool_streams[1]) != CUVS_SUCCESS ||
+      pool_streams[0] == NULL || pool_streams[1] == NULL || pool_streams[0] == pool_streams[1] ||
+      pool_streams[0] == stream || pool_streams[1] == stream ||
+      cuvsResourcesGetStreamPoolStream(res, 2, &pool_streams[0]) != CUVS_ERROR) {
+    exit(EXIT_FAILURE);
+  }
+
   // Allocate memory
   void* ptr;
   size_t bytes      = 1024;

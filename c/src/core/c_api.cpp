@@ -9,12 +9,14 @@
 #include <raft/core/device_resources_snmg.hpp>
 #include <raft/core/memory_tracking_resources.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resource/cuda_stream_pool.hpp>
 #include <raft/core/resource/device_id.hpp>
 #include <raft/core/resource/device_memory_resource.hpp>
 #include <raft/core/resource/resource_types.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/util/cudart_utils.hpp>
 #include <rapids_logger/logger.hpp>
+#include <rmm/cuda_stream_pool.hpp>
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
@@ -51,6 +53,46 @@ extern "C" cuvsError_t cuvsResourcesSetWorkspacePool(cuvsResources_t res, size_t
       *res_ptr,
       rmm::mr::pool_memory_resource{rmm::mr::get_current_device_resource_ref(),
                                     initial_size_bytes});
+  });
+}
+
+extern "C" cuvsError_t cuvsResourcesSetStreamPool(cuvsResources_t res, size_t pool_size)
+{
+  return cuvs::core::translate_exceptions([=] {
+    if (res == 0) { throw std::invalid_argument("resources handle must not be null"); }
+    if (pool_size == 0) { throw std::invalid_argument("stream pool size must be at least 1"); }
+    auto res_ptr = reinterpret_cast<raft::resources*>(res);
+    raft::resource::set_cuda_stream_pool(*res_ptr, std::make_shared<rmm::cuda_stream_pool>(pool_size));
+  });
+}
+
+extern "C" cuvsError_t cuvsResourcesGetStreamPoolSize(cuvsResources_t res, size_t* pool_size)
+{
+  return cuvs::core::translate_exceptions([=] {
+    if (res == 0 || pool_size == nullptr) {
+      throw std::invalid_argument("resources handle and pool size output must not be null");
+    }
+    auto res_ptr = reinterpret_cast<raft::resources*>(res);
+    *pool_size   = res_ptr->has_resource_factory(raft::resource::resource_type::CUDA_STREAM_POOL)
+                     ? raft::resource::get_stream_pool_size(*res_ptr)
+                     : 0;
+  });
+}
+
+extern "C" cuvsError_t cuvsResourcesGetStreamPoolStream(cuvsResources_t res,
+                                                        size_t index,
+                                                        cudaStream_t* stream)
+{
+  return cuvs::core::translate_exceptions([=] {
+    if (res == 0 || stream == nullptr) {
+      throw std::invalid_argument("resources handle and stream output must not be null");
+    }
+    auto res_ptr = reinterpret_cast<raft::resources*>(res);
+    size_t size  = res_ptr->has_resource_factory(raft::resource::resource_type::CUDA_STREAM_POOL)
+                     ? raft::resource::get_stream_pool_size(*res_ptr)
+                     : 0;
+    if (index >= size) { throw std::out_of_range("stream pool index must be less than pool size"); }
+    *stream = raft::resource::get_stream_from_stream_pool(*res_ptr, index);
   });
 }
 
