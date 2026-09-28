@@ -205,7 +205,8 @@ void tiled_brute_force_knn(const raft::resources& handle,
             IndexType row = i + (idx / current_centroid_size);
             IndexType col = j + (idx % current_centroid_size);
 
-            cuvs::distance::detail::ops::l2_exp_cutlass_op<DistanceT, DistanceT> l2_op(sqrt);
+            cuvs::distance::detail::ops::l2_exp_cutlass_op<DistanceT, DistanceT> l2_op(
+              sqrt, static_cast<DistanceT>(d));
             auto val = l2_op(row_norms[row], col_norms[col], dist[idx]);
             return distance_epilogue(val, row, col);
           });

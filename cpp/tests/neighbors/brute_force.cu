@@ -552,4 +552,54 @@ INSTANTIATE_TEST_CASE_P(RandomBruteForceKNNTest,
                         RandomBruteForceKNNTestH,
                         ::testing::ValuesIn(random_inputs));
 
+// Rows 0 and 1 have bit-equal float32 squared norms (both exactly 1.0f), and the query equals
+// row 1. The true squared distance to row 0 is about 3.99987e-4, so row 1 must rank first with
+// distance 0 and row 0 second. k <= 64 runs the fused L2 kNN kernel and k > 64 runs the tiled
+// pairwise path, so both L2 expanded epilogues are covered.
+TEST(BruteForceNearUnitL2, EqualNormRowsRankByDistance)
+{
+  raft::resources handle;
+  auto stream = raft::resource::get_cuda_stream(handle);
+
+  constexpr int64_t n_rows     = 66;
+  std::vector<float> dataset_h = {0.9998000066665778f, 0.01999866669333308f, 1.0f, 0.0f};
+  for (int64_t i = 2; i < n_rows; i++) {
+    dataset_h.push_back(10.0f + static_cast<float>(i));
+    dataset_h.push_back(0.0f);
+  }
+  std::vector<float> query_h = {1.0f, 0.0f};
+  auto dataset               = raft::make_device_matrix<float, int64_t>(handle, n_rows, 2);
+  auto query                 = raft::make_device_matrix<float, int64_t>(handle, 1, 2);
+  raft::update_device(dataset.data_handle(), dataset_h.data(), dataset_h.size(), stream);
+  raft::update_device(query.data_handle(), query_h.data(), query_h.size(), stream);
+
+  cuvs::neighbors::brute_force::index_params index_params;
+  index_params.metric = cuvs::distance::DistanceType::L2Expanded;
+  auto idx            = cuvs::neighbors::brute_force::build(
+    handle, index_params, raft::make_const_mdspan(dataset.view()));
+
+  for (int64_t k : {int64_t{2}, n_rows}) {
+    auto neighbors = raft::make_device_matrix<int64_t, int64_t>(handle, 1, k);
+    auto distances = raft::make_device_matrix<float, int64_t>(handle, 1, k);
+    cuvs::neighbors::brute_force::search(handle,
+                                         cuvs::neighbors::brute_force::search_params{},
+                                         idx,
+                                         raft::make_const_mdspan(query.view()),
+                                         neighbors.view(),
+                                         distances.view(),
+                                         cuvs::neighbors::filtering::none_sample_filter{});
+
+    std::vector<int64_t> neighbors_h(2);
+    std::vector<float> distances_h(2);
+    raft::update_host(neighbors_h.data(), neighbors.data_handle(), 2, stream);
+    raft::update_host(distances_h.data(), distances.data_handle(), 2, stream);
+    raft::resource::sync_stream(handle);
+
+    EXPECT_EQ(neighbors_h[0], 1) << "k=" << k;
+    EXPECT_EQ(distances_h[0], 0.0f) << "k=" << k;
+    EXPECT_EQ(neighbors_h[1], 0) << "k=" << k;
+    EXPECT_NEAR(distances_h[1], 3.99987e-4f, 1e-6f) << "k=" << k;
+  }
+}
+
 }  // namespace cuvs::neighbors::brute_force

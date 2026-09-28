@@ -6,46 +6,46 @@
 #pragma once
 
 #include <raft/core/math.hpp>
-#include <raft/util/cuda_dev_essentials.cuh>  // DI
+#include <raft/util/cuda_dev_essentials.cuh>  // DI, HDI
 
+#include <cuda/std/limits>
 #include <cuda_fp16.h>
 
 namespace cuvs::distance::detail::ops {
 
 /**
- * Reserve 1 digit of precision from each floating-point type
- * for round-off error tolerance.
- * @tparam DataT
+ * Whether an expanded L2 value `val = a_norm + b_norm - 2 <a, b>` lies within the rounding error
+ * of a self pair, so that identical rows report an exact-zero distance.
+ *
+ * The norms and the dot product each sum `k` products, so standard dot-product error analysis
+ * bounds the forward error of the expanded form by about k * u * (a_norm + b_norm), with u the
+ * unit roundoff of AccT; eps = 2u doubles that bound. Products of half inputs are exact in a
+ * float accumulator, so AccT's epsilon covers half data too. Only bit-equal norms qualify, and a
+ * distinct pair above the bound keeps its distance even when both norms round to the same value.
  */
-template <typename DataT, typename AccT>
-__device__ constexpr AccT get_clamp_precision()
+template <typename AccT>
+HDI bool l2_exp_within_self_rounding(AccT a_norm, AccT b_norm, AccT val, AccT k)
 {
-  switch (sizeof(DataT)) {
-    case 2: return AccT{1e-3};
-    case 4: return AccT{1e-6};
-    case 8: return AccT{1e-15};
-    default: return AccT{0};
-  }
+  return a_norm == b_norm &&
+         val <= k * cuda::std::numeric_limits<AccT>::epsilon() * (a_norm + b_norm);
 }
 
 // Epilogue operator for CUTLASS based kernel
 template <typename DataT, typename AccT>
 struct l2_exp_cutlass_op {
   bool sqrt;
+  // Reduction dimension of the dot product, which scales the self-pair rounding bound.
+  AccT k;
 
-  __device__ l2_exp_cutlass_op() noexcept : sqrt(false) {}
-  __device__ l2_exp_cutlass_op(bool isSqrt) noexcept : sqrt(isSqrt) {}
+  HDI l2_exp_cutlass_op() noexcept : sqrt(false), k(0) {}
+  HDI l2_exp_cutlass_op(bool isSqrt, AccT k_) noexcept : sqrt(isSqrt), k(k_) {}
   inline __device__ AccT operator()(AccT aNorm, AccT bNorm, AccT accVal) const noexcept
   {
     AccT outVal = aNorm + bNorm - AccT(2.0) * accVal;
-
-    /**
-     * Self-neighboring points should have (aNorm == bNorm) == accVal and the dot product (accVal)
-     * can sometimes have round-off errors, which will cause (aNorm == bNorm) ~ accVal instead.
-     */
-    outVal =
-      outVal * AccT(!((outVal * outVal < get_clamp_precision<DataT, AccT>()) * (aNorm == bNorm)));
-    return sqrt ? raft::sqrt(outVal * static_cast<AccT>(outVal > AccT(0))) : outVal;
+    if (outVal < AccT(0) || l2_exp_within_self_rounding(aNorm, bNorm, outVal, k)) {
+      outVal = AccT(0);
+    }
+    return sqrt ? raft::sqrt(outVal) : outVal;
   }
 
   __device__ AccT operator()(DataT aData) const noexcept
@@ -73,8 +73,10 @@ struct l2_exp_distance_op {
   using IdxT  = IdxType;
 
   const bool sqrt;
+  // Reduction dimension of the dot product, which scales the self-pair rounding bound.
+  const IdxT k;
 
-  l2_exp_distance_op(bool sqrt_) noexcept : sqrt(sqrt_) {}
+  l2_exp_distance_op(bool sqrt_, IdxT k_) noexcept : sqrt(sqrt_), k(k_) {}
 
   // Load norms of input data
   static constexpr bool use_norms = true;
@@ -110,17 +112,11 @@ struct l2_exp_distance_op {
     for (int i = 0; i < Policy::AccRowsPerTh; ++i) {
 #pragma unroll
       for (int j = 0; j < Policy::AccColsPerTh; ++j) {
-        AccT accVal = acc[i][j];
-        AccT val    = regxn[i] + regyn[j] - (AccT)2.0 * accVal;
-
-        /**
-         * Self-neighboring points should have (aNorm == bNorm) == accVal and the dot product
-         * (accVal) can sometimes have round-off errors, which will cause (aNorm == bNorm) ~ accVal
-         * instead.
-         */
-        acc[i][j] = val * static_cast<AccT>((val > AccT(0))) *
-                    static_cast<AccT>(
-                      !((val * val < get_clamp_precision<DataT, AccT>()) * (regxn[i] == regyn[j])));
+        AccT val = regxn[i] + regyn[j] - (AccT)2.0 * acc[i][j];
+        if (val < AccT(0) || l2_exp_within_self_rounding(regxn[i], regyn[j], val, AccT(k))) {
+          val = AccT(0);
+        }
+        acc[i][j] = val;
       }
     }
     if (sqrt) {
@@ -136,7 +132,7 @@ struct l2_exp_distance_op {
 
   constexpr l2_exp_cutlass_op<DataT, AccT> get_cutlass_op() const
   {
-    return l2_exp_cutlass_op<DataT, AccT>(sqrt);
+    return l2_exp_cutlass_op<DataT, AccT>(sqrt, static_cast<AccT>(k));
   }
 };
 

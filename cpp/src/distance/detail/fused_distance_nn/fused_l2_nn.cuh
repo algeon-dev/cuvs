@@ -61,7 +61,7 @@ void fusedL2NNImpl(OutT* min,
 
   namespace arch = raft::util::arch;
   using AccT     = DataT;
-  ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{sqrt};
+  ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{sqrt, k};
 
   raft::identity_op fin_op{};
 
@@ -88,7 +88,7 @@ void fusedL2NNImpl(OutT* min,
     using L2Op                  = cuvs::distance::detail::ops::l2_exp_cutlass_op<DataT, DataT>;
     using kvp_cg_min_reduce_op_ = kvp_cg_min_reduce_op<DataT, IdxT, OutT>;
     kvp_cg_min_reduce_op_ cg_reduce_op;
-    L2Op L2_dist_op(sqrt);
+    L2Op L2_dist_op(sqrt, static_cast<DataT>(k));
 
     IdxT lda, ldb, ldd;
     lda = k, ldb = k, ldd = n;
