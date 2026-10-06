@@ -37,6 +37,13 @@ function(find_and_configure_raft)
         string(APPEND RAFT_COMPONENTS " distributed")
     endif()
 
+    # Algeon carries RAFT fixes as git diffs. The patch step reruns after every update step of the
+    # pinned branch, so it restores the tracked files before applying the diff. A PATCH_COMMAND also
+    # makes rapids_cpm_find fetch RAFT instead of accepting an installed, unpatched copy, and a diff
+    # that stops applying fails the configure.
+    find_package(Git REQUIRED)
+    set(raft_patch "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../patches/raft-lanczos-invariant-subspace.diff")
+
     #-----------------------------------------------------
     # Invoke CPM find_package()
     #-----------------------------------------------------
@@ -50,6 +57,8 @@ function(find_and_configure_raft)
               GIT_REPOSITORY        https://github.com/${PKG_FORK}/raft.git
               GIT_TAG               ${PKG_PINNED_TAG}
               SOURCE_SUBDIR         cpp
+              PATCH_COMMAND         ${GIT_EXECUTABLE} checkout -- .
+                COMMAND             ${GIT_EXECUTABLE} apply ${raft_patch}
               OPTIONS
               "BUILD_TESTS OFF"
               "BUILD_PRIMS_BENCH OFF"

@@ -1,0 +1,270 @@
+diff --git a/cpp/include/raft/sparse/solver/detail/lanczos.cuh b/cpp/include/raft/sparse/solver/detail/lanczos.cuh
+index 9aa4304..10dd00e 100644
+--- a/cpp/include/raft/sparse/solver/detail/lanczos.cuh
++++ b/cpp/include/raft/sparse/solver/detail/lanczos.cuh
+@@ -61,7 +61,9 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
++#include <limits>
+ #include <optional>
++#include <random>
+ #include <type_traits>
+ #include <utility>
+ #include <vector>
+@@ -103,11 +105,7 @@ RAFT_KERNEL kernel_normalize(const T* u, const T* beta, int j, int n, T* v, T* V
+   int i = blockIdx.x * blockDim.x + threadIdx.x;
+ 
+   if (i < size) {
+-    if (beta[j] == 0) {
+-      v[i] = u[i] / 1;
+-    } else {
+-      v[i] = u[i] / beta[j];
+-    }
++    v[i]               = u[i] / beta[j];
+     V[i + (j + 1) * n] = v[i];
+   }
+ }
+@@ -118,11 +116,89 @@ RAFT_KERNEL kernel_clamp_down(T* value, T threshold)
+   *value = (fabs(*value) < threshold) ? 0 : *value;
+ }
+ 
+-template <typename T>
+-RAFT_KERNEL kernel_clamp_down_vector(T* vec, T threshold, int size)
++/**
++ * Relative size of a Lanczos coefficient below which the Krylov space counts as invariant.
++ *
++ * One reorthogonalization pass leaves a new basis vector about eps * ||A|| / beta away from
++ * orthogonal. Treating beta <= sqrt(eps) * ||A|| as an exact zero keeps the basis
++ * semi-orthogonal, which keeps the Ritz values accurate to working precision, and drops
++ * couplings no larger than sqrt(eps) * ||A||.
++ */
++template <typename ValueTypeT>
++ValueTypeT lanczos_breakdown_tolerance()
+ {
+-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+-  if (idx < size) { vec[idx] = (fabs(vec[idx]) < threshold) ? 0 : vec[idx]; }
++  return std::sqrt(std::numeric_limits<ValueTypeT>::epsilon());
++}
++
++/**
++ * Overwrites row `j` of `V` with a unit random vector orthogonal to rows `0..j-1`.
++ *
++ * Used when those rows span a numerically invariant subspace of A. The Lanczos residual is then
++ * rounding noise, and normalizing it would amplify that noise into a vector that is not
++ * orthogonal to the basis.
++ */
++template <typename ValueTypeT>
++void lanczos_restart_vector(raft::resources const& handle,
++                            raft::device_matrix_view<ValueTypeT, uint32_t, raft::row_major> V,
++                            int j,
++                            raft::device_matrix_view<ValueTypeT, uint32_t> uu,
++                            raft::random::RngState& rng)
++{
++  auto stream = resource::get_cuda_stream(handle);
++  int n       = V.extent(1);
++  auto row    = raft::make_device_vector_view<ValueTypeT, uint32_t>(
++    V.data_handle() + j * V.stride(0), V.extent(1));
++  raft::random::uniform(handle, rng, row, ValueTypeT{-1}, ValueTypeT{1});
++
++  ValueTypeT one  = 1;
++  ValueTypeT zero = 0;
++  ValueTypeT mone = -1;
++  // A single classical Gram-Schmidt pass leaves rounding error along the basis; a second pass
++  // makes the vector orthogonal to working precision.
++  for (int pass = 0; pass < 2; pass++) {
++    raft::linalg::gemv(handle,
++                       CUBLAS_OP_T,
++                       n,
++                       j,
++                       &one,
++                       V.data_handle(),
++                       n,
++                       row.data_handle(),
++                       1,
++                       &zero,
++                       uu.data_handle(),
++                       1,
++                       stream);
++    raft::linalg::gemv(handle,
++                       CUBLAS_OP_N,
++                       n,
++                       j,
++                       &mone,
++                       V.data_handle(),
++                       n,
++                       uu.data_handle(),
++                       1,
++                       &one,
++                       row.data_handle(),
++                       1,
++                       stream);
++  }
++
++  auto row_norm = raft::make_device_vector<ValueTypeT, uint32_t>(handle, 1);
++  raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
++    handle,
++    raft::make_device_matrix_view<const ValueTypeT, uint32_t>(row.data_handle(), 1, n),
++    row_norm.view(),
++    raft::sqrt_op());
++  ValueTypeT row_norm_host = 0;
++  raft::copy(&row_norm_host, row_norm.data_handle(), 1, stream);
++  resource::sync_stream(handle, stream);
++  RAFT_EXPECTS(row_norm_host > 0, "Lanczos restart vector lies in the span of the basis");
++  raft::linalg::map(
++    handle,
++    row,
++    [scale = ValueTypeT{1} / row_norm_host] __device__(ValueTypeT x) { return x * scale; },
++    raft::make_const_mdspan(row));
+ }
+ 
+ template <typename IndexTypeT, typename ValueTypeT>
+@@ -257,7 +333,9 @@ void lanczos_aux(raft::resources const& handle,
+                  raft::device_matrix_view<ValueTypeT, uint32_t> v,
+                  raft::device_matrix_view<ValueTypeT, uint32_t> uu,
+                  raft::device_matrix_view<ValueTypeT, uint32_t> vv,
+-                 std::optional<uint64_t> seed)
++                 std::optional<uint64_t> seed,
++                 ValueTypeT& anorm,
++                 raft::random::RngState& restart_rng)
+ {
+   // Deterministic when seed is provided
+   cusparseSpMVAlg_t spmv_alg;
+@@ -379,22 +457,30 @@ void lanczos_aux(raft::resources const& handle,
+     raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
+       handle, input, output, raft::sqrt_op());
+ 
+-    int blockSize = 256;
+-    int numBlocks = (n + blockSize - 1) / blockSize;
+-
+-    kernel_clamp_down_vector<<<numBlocks, blockSize, 0, stream>>>(
+-      u.data_handle(), static_cast<ValueTypeT>(1e-7), n);
+-
+-    kernel_clamp_down<<<1, 1, 0, stream>>>(beta.data_handle() + beta.stride(1) * i,
+-                                           static_cast<ValueTypeT>(1e-6));
++    // anorm is a running Gershgorin bound of T, which estimates ||A|| without another SpMV.
++    ValueTypeT beta_i_host = 0;
++    raft::copy(&beta_i_host, output.data_handle(), 1, stream);
++    resource::sync_stream(handle, stream);
++    anorm = std::max(anorm, std::abs(alpha_i_host) + std::abs(b) + beta_i_host);
++    bool const invariant = beta_i_host <= lanczos_breakdown_tolerance<ValueTypeT>() * anorm;
++    if (invariant) {
++      RAFT_CUDA_TRY(cudaMemsetAsync(output.data_handle(), 0, sizeof(ValueTypeT), stream));
++    }
+ 
+     if (i >= end_idx - 1) { break; }
+ 
+-    int threadsPerBlock = 256;
+-    int blocksPerGrid   = (n + threadsPerBlock - 1) / threadsPerBlock;
++    if (invariant) {
++      // The zero coupling keeps T block tridiagonal: the finished block holds exact eigenvalues
++      // of A, and the next block explores directions the start vector did not reach.
++      lanczos_restart_vector(handle, V, i + 1, uu, restart_rng);
++      raft::copy(v.data_handle(), V.data_handle() + (i + 1) * V.stride(0), n, stream);
++    } else {
++      int threadsPerBlock = 256;
++      int blocksPerGrid   = (n + threadsPerBlock - 1) / threadsPerBlock;
+ 
+-    kernel_normalize<ValueTypeT><<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
+-      u.data_handle(), beta.data_handle(), i, n, v.data_handle(), V.data_handle(), n);
++      kernel_normalize<ValueTypeT><<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
++        u.data_handle(), beta.data_handle(), i, n, v.data_handle(), V.data_handle(), n);
++    }
+   }
+ }
+ 
+@@ -457,6 +543,11 @@ auto lanczos_smallest(raft::resources const& handle,
+   auto aux_uu = raft::make_device_matrix<ValueTypeT, uint32_t, raft::row_major>(handle, 1, ncv);
+   auto vv     = raft::make_device_matrix<ValueTypeT, uint32_t, raft::row_major>(handle, 1, n);
+ 
++  ValueTypeT anorm = 0;
++  // Restart vectors draw from subsequences disjoint from the start vector drawn with this seed.
++  raft::random::RngState restart_rng(
++    seed.value_or(std::random_device{}()), uint64_t{1} << 32, raft::random::GeneratorType::GenPC);
++
+   lanczos_aux<IndexTypeT, ValueTypeT, AType>(handle,
+                                              A,
+                                              V.view(),
+@@ -469,7 +560,9 @@ auto lanczos_smallest(raft::resources const& handle,
+                                              v.view(),
+                                              aux_uu.view(),
+                                              vv.view(),
+-                                             seed);
++                                             seed,
++                                             anorm,
++                                             restart_rng);
+ 
+   auto eigenvectors =
+     raft::make_device_matrix<ValueTypeT, uint32_t, raft::col_major>(handle, ncv, ncv);
+@@ -585,11 +678,20 @@ auto lanczos_smallest(raft::resources const& handle,
+     raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
+       handle, raft::make_const_mdspan(u.view()), unrm.view(), raft::sqrt_op());
+ 
+-    raft::linalg::unary_op(
+-      handle,
+-      raft::make_const_mdspan(u_vector),
+-      V_0_view,
+-      [device_scalar = unrm.data_handle()] __device__(auto y) { return y / *device_scalar; });
++    ValueTypeT unrm_host = 0;
++    raft::copy(&unrm_host, unrm.data_handle(), 1, stream);
++    resource::sync_stream(handle, stream);
++    if (unrm_host <= lanczos_breakdown_tolerance<ValueTypeT>() * anorm) {
++      // The Ritz vectors span an invariant subspace, so their coupling to the residual is zero.
++      raft::matrix::fill(handle, beta_k.view(), zero);
++      lanczos_restart_vector(handle, V.view(), nEigVecs, aux_uu.view(), restart_rng);
++    } else {
++      raft::linalg::unary_op(
++        handle,
++        raft::make_const_mdspan(u_vector),
++        V_0_view,
++        [device_scalar = unrm.data_handle()] __device__(auto y) { return y / *device_scalar; });
++    }
+ 
+     auto cusparse_h                 = resource::get_cusparse_handle(handle);
+     cusparseSpMatDescr_t cusparse_A = raft::sparse::linalg::detail::create_descriptor(A);
+@@ -675,16 +777,24 @@ auto lanczos_smallest(raft::resources const& handle,
+     raft::linalg::norm<raft::linalg::L2Norm, raft::Apply::ALONG_ROWS>(
+       handle, raft::make_const_mdspan(u.view()), output1, raft::sqrt_op());
+ 
+-    auto V_kplus1 =
+-      raft::make_device_vector_view<ValueTypeT>(V.data_handle() + V.stride(0) * (nEigVecs + 1), n);
+-
+-    raft::linalg::unary_op(
+-      handle,
+-      make_const_mdspan(u_vector),
+-      V_kplus1,
+-      [device_scalar = (beta.data_handle() + beta.stride(1) * nEigVecs)] __device__(auto y) {
+-        return y / *device_scalar;
+-      });
++    ValueTypeT beta_restart_host = 0;
++    raft::copy(&beta_restart_host, output1.data_handle(), 1, stream);
++    resource::sync_stream(handle, stream);
++    if (beta_restart_host <= lanczos_breakdown_tolerance<ValueTypeT>() * anorm) {
++      RAFT_CUDA_TRY(cudaMemsetAsync(output1.data_handle(), 0, sizeof(ValueTypeT), stream));
++      lanczos_restart_vector(handle, V.view(), nEigVecs + 1, aux_uu.view(), restart_rng);
++    } else {
++      auto V_kplus1 = raft::make_device_vector_view<ValueTypeT>(
++        V.data_handle() + V.stride(0) * (nEigVecs + 1), n);
++
++      raft::linalg::unary_op(
++        handle,
++        make_const_mdspan(u_vector),
++        V_kplus1,
++        [device_scalar = (beta.data_handle() + beta.stride(1) * nEigVecs)] __device__(auto y) {
++          return y / *device_scalar;
++        });
++    }
+ 
+     lanczos_aux<IndexTypeT, ValueTypeT, AType>(handle,
+                                                A,
+@@ -698,7 +808,9 @@ auto lanczos_smallest(raft::resources const& handle,
+                                                v.view(),
+                                                aux_uu.view(),
+                                                vv.view(),
+-                                               seed);
++                                               seed,
++                                               anorm,
++                                               restart_rng);
+     iter += ncv - nEigVecs;
+     lanczos_solve_ritz<IndexTypeT, ValueTypeT>(handle,
+                                                alpha.view(),
