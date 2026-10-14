@@ -725,7 +725,7 @@ void fusedL2ExpKnnImpl(const DataT* x,
 
   typedef cub::KeyValuePair<uint32_t, AccT> Pair;
 
-  cuvs::distance::detail::ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{sqrt, k};
+  cuvs::distance::detail::ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{sqrt};
   raft::identity_op fin_op{};
 
   if constexpr (isRowMajor) {

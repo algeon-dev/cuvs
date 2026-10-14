@@ -170,9 +170,8 @@ INSTANTIATE_TEST_CASE_P(DistanceTests, DistanceEucExpTestD, ::testing::ValuesIn(
 class BigMatrixEucExp : public BigMatrixDistanceTest<cuvs::distance::DistanceType::L2Expanded> {};
 TEST_F(BigMatrixEucExp, Result) {}
 
-// Both x rows have a float32 squared norm of exactly 1.0f, the same as y, so the
-// equal-norm self-distance guard applies to the near-unit pair even though its true
-// squared distance (about 3.99987e-4) is far above float rounding noise.
+// Both x rows and y have a float32 squared norm of exactly 1.0f. The distinct pair
+// retains its squared distance even though the norms compare equal.
 TEST(DistanceEucExpNearUnit, EqualNormPairKeepsDistance)
 {
   raft::resources handle;
@@ -198,6 +197,48 @@ TEST(DistanceEucExpNearUnit, EqualNormPairKeepsDistance)
 
   EXPECT_NEAR(dist_h[0], 3.99987e-4f, 1e-6f);
   EXPECT_EQ(dist_h[1], 0.0f);
+}
+
+TEST(DistanceEucExpNearUnit, DenseEqualNormPairsKeepSubCutoffDistances)
+{
+  raft::resources handle;
+  auto stream = raft::resource::get_cuda_stream(handle);
+
+  constexpr int64_t dim = 64;
+  std::vector<float> x_h(3 * dim, 0.125f);
+  std::vector<float> y_h(dim, 0.125f);
+  x_h[0]       = 0.12388256192207336f;
+  x_h[1]       = 0.12610752880573273f;
+  x_h[dim]     = 0.12228381633758545f;
+  x_h[dim + 1] = 0.1276583969593048f;
+  auto x       = raft::make_device_matrix<float, int64_t>(handle, 3, dim);
+  auto y       = raft::make_device_matrix<float, int64_t>(handle, 1, dim);
+  auto dist    = raft::make_device_matrix<float, int64_t>(handle, 3, 1);
+  raft::update_device(x.data_handle(), x_h.data(), x_h.size(), stream);
+  raft::update_device(y.data_handle(), y_h.data(), y_h.size(), stream);
+  cuvs::distance::pairwise_distance(handle,
+                                    raft::make_const_mdspan(x.view()),
+                                    raft::make_const_mdspan(y.view()),
+                                    dist.view(),
+                                    cuvs::distance::DistanceType::L2Expanded);
+  std::vector<float> distances_h(3);
+  raft::update_host(distances_h.data(), dist.data_handle(), distances_h.size(), stream);
+  raft::resource::sync_stream(handle);
+
+  for (int64_t row = 0; row < 3; ++row) {
+    float norm      = 0.0f;
+    double expected = 0.0;
+    for (int64_t column = 0; column < dim; ++column) {
+      auto value = x_h[row * dim + column];
+      norm += value * value;
+      double difference = static_cast<double>(value) - y_h[column];
+      expected += difference * difference;
+    }
+    ASSERT_EQ(norm, 1.0f);
+    EXPECT_NEAR(distances_h[row], expected, 1e-6) << "row=" << row;
+    if (row < 2) { EXPECT_GT(distances_h[row], 0.0f) << "row=" << row; }
+  }
+  EXPECT_EQ(distances_h[2], 0.0f);
 }
 }  // end namespace distance
 }  // namespace cuvs

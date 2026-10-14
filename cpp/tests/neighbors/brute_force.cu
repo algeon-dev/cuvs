@@ -17,6 +17,9 @@
 
 #include <cuda_fp16.h>
 
+#include <algorithm>
+#include <cmath>
+
 namespace cuvs::neighbors::brute_force {
 
 template <typename T>
@@ -599,6 +602,78 @@ TEST(BruteForceNearUnitL2, EqualNormRowsRankByDistance)
     EXPECT_EQ(distances_h[0], 0.0f) << "k=" << k;
     EXPECT_EQ(neighbors_h[1], 0) << "k=" << k;
     EXPECT_NEAR(distances_h[1], 3.99987e-4f, 1e-6f) << "k=" << k;
+  }
+}
+
+TEST(BruteForceNearUnitL2, DenseEqualNormRowsPreserveTiesAndSmallDistances)
+{
+  raft::resources handle;
+  auto stream = raft::resource::get_cuda_stream(handle);
+
+  constexpr int64_t dim    = 64;
+  constexpr int64_t n_rows = 80;
+  std::vector<float> query_h(dim, 0.125f);
+  std::vector<float> dataset_h(n_rows * dim, 0.125f);
+  // These rotations retain a rounded squared norm of 1, with distinct distances below 64 * eps * 2.
+  for (int64_t row = 0; row < 10; ++row) {
+    dataset_h[row * dim]     = row % 2 == 0 ? 0.12388256192207336f : 0.12228381633758545f;
+    dataset_h[row * dim + 1] = row % 2 == 0 ? 0.12610752880573273f : 0.1276583969593048f;
+  }
+  for (int64_t row = 20; row < n_rows; ++row) {
+    dataset_h[row * dim] = 0.75f;
+  }
+  auto dataset = raft::make_device_matrix<float, int64_t>(handle, n_rows, dim);
+  auto query   = raft::make_device_matrix<float, int64_t>(handle, 1, dim);
+  raft::update_device(dataset.data_handle(), dataset_h.data(), dataset_h.size(), stream);
+  raft::update_device(query.data_handle(), query_h.data(), query_h.size(), stream);
+
+  cuvs::neighbors::brute_force::index_params index_params;
+  index_params.metric = cuvs::distance::DistanceType::L2Expanded;
+  auto idx            = cuvs::neighbors::brute_force::build(
+    handle, index_params, raft::make_const_mdspan(dataset.view()));
+
+  for (int64_t k : {int64_t{10}, int64_t{65}}) {
+    auto neighbors = raft::make_device_matrix<int64_t, int64_t>(handle, 1, k);
+    auto distances = raft::make_device_matrix<float, int64_t>(handle, 1, k);
+    cuvs::neighbors::brute_force::search(handle,
+                                         cuvs::neighbors::brute_force::search_params{},
+                                         idx,
+                                         raft::make_const_mdspan(query.view()),
+                                         neighbors.view(),
+                                         distances.view(),
+                                         cuvs::neighbors::filtering::none_sample_filter{});
+    std::vector<int64_t> neighbors_h(k);
+    std::vector<float> distances_h(k);
+    raft::update_host(neighbors_h.data(), neighbors.data_handle(), k, stream);
+    raft::update_host(distances_h.data(), distances.data_handle(), k, stream);
+    raft::resource::sync_stream(handle);
+
+    std::vector<int64_t> zero_neighbors(neighbors_h.begin(), neighbors_h.begin() + 10);
+    std::sort(zero_neighbors.begin(), zero_neighbors.end());
+    for (int64_t rank = 0; rank < 10; ++rank) {
+      EXPECT_EQ(zero_neighbors[rank], 10 + rank) << "k=" << k;
+      EXPECT_EQ(distances_h[rank], 0.0f) << "k=" << k;
+    }
+    std::vector<bool> near_rows_seen(10, false);
+    for (int64_t rank = 0; rank < k; ++rank) {
+      auto row = neighbors_h[rank];
+      ASSERT_GE(row, 0);
+      ASSERT_LT(row, n_rows);
+      double expected = 0.0;
+      for (int64_t column = 0; column < dim; ++column) {
+        double difference = static_cast<double>(dataset_h[row * dim + column]) - query_h[column];
+        expected += difference * difference;
+      }
+      EXPECT_NEAR(distances_h[rank], expected, 1e-6) << "k=" << k << ", row=" << row;
+      if (row < 10) {
+        near_rows_seen[row] = true;
+        EXPECT_GT(distances_h[rank], 0.0f) << "k=" << k << ", row=" << row;
+      }
+    }
+    if (k > 64) {
+      EXPECT_TRUE(
+        std::all_of(near_rows_seen.begin(), near_rows_seen.end(), [](bool seen) { return seen; }));
+    }
   }
 }
 

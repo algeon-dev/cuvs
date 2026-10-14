@@ -588,7 +588,7 @@ void distance_impl_l2_expanded(  // NOTE: different name
     }
   }
 
-  ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{perform_sqrt, k};
+  ops::l2_exp_distance_op<DataT, AccT, IdxT> distance_op{perform_sqrt};
   pairwise_matrix_dispatch<decltype(distance_op), DataT, AccT, OutT, FinOpT, IdxT>(
     distance_op, m, n, k, x, y, x_norm, y_norm, out, fin_op, stream, is_row_major);
 }
